@@ -1,0 +1,124 @@
+# ==========================================
+# Python
+# ==========================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+
+# ==========================================
+# Environment / Secrets
+# ==========================================
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+
+
+# ==========================================
+# Local Databases
+# ==========================================
+
+*.db
+*.sqlite
+*.sqlite3
+
+
+# ==========================================
+# Hugging Face / ML
+# ==========================================
+
+.cache/
+huggingface/
+models/
+
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+
+# ==========================================
+# React / Node / Vite
+# ==========================================
+
+node_modules/
+frontend/node_modules/
+
+dist/
+frontend/dist/
+
+.vite/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+
+# ==========================================
+# IDE / Editor
+# ==========================================
+
+.vscode/
+.idea/
+
+*.swp
+*.swo
+
+
+# ==========================================
+# macOS
+# ==========================================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+
+
+# ==========================================
+# Logs / Temporary Files
+# ==========================================
+
+*.log
+logs/
+
+tmp/
+temp/
+
+*.tmp
+
+
+# ==========================================
+# Test / Coverage Artifacts
+# ==========================================
+
+coverage/
+.coverage.*
+junit.xml
+
+
+# ==========================================
+# Project-specific temporary test scripts
+# ==========================================
+
+test_mcp.py
+test_create_mcp.py
