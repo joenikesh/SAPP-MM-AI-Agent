@@ -41,6 +41,10 @@ app.add_middleware(
 
 pending_creations = {}
 
+# Stores the latest read/query outcome for conversational follow-ups.
+# This is intentionally separate from write-confirmation state.
+session_contexts = {}
+
 
 # -------------------------------------------------
 # REQUEST / RESPONSE MODELS
@@ -81,6 +85,7 @@ async def chat(request: ChatRequest):
         message=request.message,
         session_id=request.session_id,
         pending_creations=pending_creations,
+        session_contexts=session_contexts,
     )
 
     return ChatResponse(

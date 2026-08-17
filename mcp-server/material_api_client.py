@@ -33,6 +33,16 @@ async def search_materials(
         return response.json()
 
 
+async def query_materials(query_plan: dict):
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{MATERIAL_API_BASE_URL}/materials/query",
+            json=query_plan,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 async def get_material(material_number: str):
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -42,7 +52,7 @@ async def get_material(material_number: str):
         response.raise_for_status()
         return response.json()
 
-    import httpx
+
 
 MATERIAL_API_BASE_URL = "http://127.0.0.1:8001"
 

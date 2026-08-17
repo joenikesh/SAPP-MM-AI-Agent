@@ -9,42 +9,47 @@ from transformers import pipeline
 
 try:
     import torch
-except ImportError:  # pragma: no cover - torch should always be present
+except ImportError:
     torch = None
 
 from prompts import SYSTEM_PROMPT
+from query_plan import validate_query_plan
+
 from mcp_client import (
     search_material_master,
     explain_material_master,
     create_material_master,
+    query_material_master,
 )
 
 
+# ============================================================
+# MODEL
+# ============================================================
+
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
-# Similarity controls.
-# Tune these later as you test with real material data.
-SIMILARITY_THRESHOLD = 0.68
-MAX_SIMILAR_RESULTS = 3
 
-# Conversation workflow stages.
-STAGE_SIMILARITY_CONFIRMATION = "similarity_confirmation"
-STAGE_CREATION_CONFIRMATION = "creation_confirmation"
+_pipeline_kwargs: Dict[str, Any] = {
+    "model": MODEL_NAME,
+}
 
-# How long an abandoned material-creation flow is kept before it's
-# swept away. Prevents pending_creations from growing forever on a
-# long-running server.
-PENDING_CREATION_TTL_SECONDS = 30 * 60
-
-
-# Build the pipeline with an explicit device/dtype instead of relying
-# on defaults, which silently fall back to fp32 on CPU and are much
-# slower than necessary when a GPU is available.
-_pipeline_kwargs: Dict[str, Any] = {"model": MODEL_NAME}
-
+# NOTE: torch.cuda.is_available() is always False on macOS -- there is
+# no CUDA on Mac. Without an explicit Apple Silicon (MPS) check, this
+# was silently falling back to plain CPU inference on Mac even though
+# an MPS-capable GPU was available, which is a large chunk of why
+# generation was slow enough to hit the frontend's response timeout.
 if torch is not None and torch.cuda.is_available():
     _pipeline_kwargs["device_map"] = "auto"
     _pipeline_kwargs["torch_dtype"] = torch.bfloat16
+elif (
+    torch is not None
+    and getattr(torch.backends, "mps", None) is not None
+    and torch.backends.mps.is_available()
+):
+    _pipeline_kwargs["device"] = "mps"
+    _pipeline_kwargs["torch_dtype"] = torch.float16
+
 
 generator = pipeline(
     "text-generation",
@@ -52,11 +57,12 @@ generator = pipeline(
 )
 
 
-async def generate_async(prompt: str, **kwargs) -> str:
+async def generate_async(
+    prompt: str,
+    **kwargs,
+) -> str:
     """
-    Run the (blocking, synchronous) text-generation pipeline off the
-    event loop so a single slow generation doesn't stall every other
-    concurrent request being served by this process.
+    Run Hugging Face generation outside the FastAPI event loop.
     """
 
     result = await asyncio.to_thread(
@@ -66,11 +72,20 @@ async def generate_async(prompt: str, **kwargs) -> str:
     )
 
     generated = result[0]["generated_text"]
-    return generated[len(prompt):].strip()
 
+    if generated.startswith(prompt):
+        generated = generated[len(prompt):]
+
+    return generated.strip()
+
+
+# ============================================================
+# AGENT CONFIGURATION
+# ============================================================
 
 ALLOWED_ACTIONS = {
     "search_material",
+    "query_materials",
     "get_material",
     "create_material",
     "need_information",
@@ -80,11 +95,32 @@ ALLOWED_ACTIONS = {
 
 
 OUT_OF_SCOPE_MESSAGE = (
-    "I can only assist with SAP MM Material Master tasks, including "
-    "material search, material details, SAP MM field explanations, "
-    "validation, and material creation."
+    "I can only assist with SAP MM Material Master tasks, "
+    "including material search, material details, SAP MM field "
+    "explanations, validation, and material creation."
 )
 
+
+# Similar-material controls.
+# Lowered from 0.68 alongside the description-similarity rebalance
+# above so that short/generic requests (e.g. "Pump") can actually
+# cross the bar against verbose real descriptions that contain them.
+SIMILARITY_THRESHOLD = 0.62
+MAX_SIMILAR_RESULTS = 5
+
+
+# Material creation workflow stages.
+STAGE_SIMILARITY_CONFIRMATION = "similarity_confirmation"
+STAGE_CREATION_CONFIRMATION = "creation_confirmation"
+
+
+# Abandoned creation flows expire after 30 minutes.
+PENDING_CREATION_TTL_SECONDS = 30 * 60
+
+
+# ============================================================
+# USER CONFIRMATION RESPONSES
+# ============================================================
 
 YES_RESPONSES = {
     "yes",
@@ -124,40 +160,42 @@ CANCEL_RESPONSES = {
 
 
 # ============================================================
-# SCOPE / SAFETY FAST PATHS
-#
-# These run in plain Python, before any model call. They exist to
-# (a) avoid spending an LLM call on obviously in/out-of-scope
-# messages and (b) act as a deterministic backstop so a small model's
-# occasional misclassification can't let an off-topic answer or a
-# fabricated "I searched the web" claim reach the user.
+# HARD SCOPE FILTERS
 # ============================================================
 
-# Keywords that are unambiguously outside SAP MM Material Master.
-# This is intentionally conservative: it only short-circuits requests
-# that are *obviously* off-topic. Anything ambiguous still goes to
-# the LLM planner, which has its own scope instructions.
 OBVIOUS_OFF_TOPIC_TERMS = {
-    "weather", "forecast", "temperature outside",
-    "election", "president", "prime minister",
-    "stock price", "crypto", "bitcoin",
-    "recipe", "cook", "restaurant",
-    "joke", "riddle", "poem", "song lyrics",
-    "sports score", "football score", "basketball score",
-    "movie", "tv show", "celebrity",
-    "write me code", "write python", "write javascript",
+    "weather",
+    "forecast",
+    "temperature outside",
+    "election",
+    "president",
+    "prime minister",
+    "stock price",
+    "crypto",
+    "bitcoin",
+    "recipe",
+    "restaurant",
+    "joke",
+    "riddle",
+    "poem",
+    "song lyrics",
+    "sports score",
+    "football score",
+    "basketball score",
+    "movie",
+    "tv show",
+    "celebrity",
+    "write me code",
+    "write python",
+    "write javascript",
 }
 
-# SAP MM material numbers in this system look like SYN-FG-000001.
-# When a message is *just* a lookup of one of these, we can route
-# straight to get_material without spending a planner call.
-MATERIAL_NUMBER_PATTERN = re.compile(r"\b[A-Z]{2,4}-[A-Z]{2,4}-\d{4,8}\b")
 
-# Phrases that indicate the model has claimed to browse the internet
-# or cite an external source it does not have access to. Prompt-level
-# instructions ("do not claim to browse the internet") are a soft
-# constraint a small model can still violate, so this is a hard
-# post-generation filter applied on top of them.
+MATERIAL_NUMBER_PATTERN = re.compile(
+    r"\b[A-Z]{2,4}-[A-Z]{2,5}-\d{4,8}\b"
+)
+
+
 BROWSING_CLAIM_PATTERN = re.compile(
     r"(searched (the )?(internet|web|google)"
     r"|according to (google|the internet|wikipedia)"
@@ -168,114 +206,233 @@ BROWSING_CLAIM_PATTERN = re.compile(
 )
 
 
-def is_obviously_off_topic(message: str) -> bool:
-    normalized = normalize_text(message)
+# ============================================================
+# SAP CODE GLOSSARY
+# ============================================================
 
-    if "material" in normalized or "sap" in normalized:
-        # Mentions the domain directly — let the LLM planner decide,
-        # rather than risk a false-positive reject here.
-        return False
-
-    return any(term in normalized for term in OBVIOUS_OFF_TOPIC_TERMS)
-
-
-def extract_material_number(message: str):
-    match = MATERIAL_NUMBER_PATTERN.search(message.upper())
-    return match.group(0) if match else None
-
-
-def extract_json_object(text: str) -> dict:
-    """
-    Parse the first balanced JSON object in `text`.
-
-    Using json.JSONDecoder().raw_decode instead of a regex means
-    nested objects/arrays in the model's output don't silently
-    truncate the match the way `re.search(r"\\{.*?\\}")` can.
-    """
-
-    decoder = json.JSONDecoder()
-    start = text.find("{")
-
-    if start == -1:
-        raise ValueError("No JSON object found in model output")
-
-    obj, _ = decoder.raw_decode(text, start)
-
-    if not isinstance(obj, dict):
-        raise ValueError("Top-level JSON value was not an object")
-
-    return obj
-
-
-def strip_browsing_claims(text: str) -> str:
-    """
-    Hard backstop: if the model's free-text answer claims to have
-    browsed the internet or cited an external source, replace it
-    with an explicit, honest statement of what this assistant can
-    actually do, instead of forwarding the claim to the user.
-    """
-
-    if BROWSING_CLAIM_PATTERN.search(text):
-        return (
-            "I can only answer using SAP MM Material Master data and "
-            "definitions available to me directly — I don't browse "
-            "the internet or cite outside sources."
-        )
-
-    return text
-
-
-def sweep_expired_pending_creations(pending_creations: dict) -> None:
-    """
-    Remove abandoned material-creation flows so pending_creations
-    doesn't grow without bound on a long-running server.
-    """
-
-    now = time.time()
-
-    expired = [
-        session_id
-        for session_id, entry in pending_creations.items()
-        if now - entry.get("_created_at", now) > PENDING_CREATION_TTL_SECONDS
-    ]
-
-    for session_id in expired:
-        del pending_creations[session_id]
-
-
-# A small, fixed glossary of SAP MM code meanings. These are stable,
-# SAP-defined enumerations, not org-specific data, so they're looked
-# up deterministically instead of asking the model to recall them
-# from parametric memory. Extend this with the codes your org
-# actually uses; the LLM is only a fallback for phrasing questions
-# this glossary doesn't cover.
 SAP_CODE_GLOSSARY = {
-    "FERT": "Finished product — manufactured in-house and ready for sale.",
-    "HALB": "Semi-finished product — partially processed, used in further production.",
-    "ROH": "Raw material — procured externally and consumed in production.",
-    "HAWA": "Trading good — purchased and resold without further processing.",
-    "DIEN": "Service — a non-physical material type used for service procurement.",
+    "FERT": (
+        "Finished product — manufactured in-house and "
+        "ready for sale."
+    ),
+
+    "HALB": (
+        "Semi-finished product — partially processed and "
+        "used in further production."
+    ),
+
+    "ROH": (
+        "Raw material — normally procured externally and "
+        "consumed in production."
+    ),
+
+    "HAWA": (
+        "Trading good — purchased and resold without "
+        "further processing."
+    ),
+
+    "DIEN": (
+        "Service — a non-physical material type used "
+        "for service procurement."
+    ),
+
     "VERP": "Packaging material.",
-    "PD": "MRP type: MRP-controlled planning (demand-driven).",
-    "VB": "MRP type: Reorder point planning.",
-    "ND": "MRP type: No planning — not relevant for MRP.",
-    "F": "Procurement type: External procurement (purchased).",
-    "E": "Procurement type: In-house production.",
-    "X": "Procurement type: Both external and in-house allowed.",
-    "S": "Price control: Standard price — valuated at a fixed price.",
-    "V": "Price control: Moving average price — valuated at a recalculated average.",
+
+    "PD": (
+        "MRP type: MRP-controlled planning."
+    ),
+
+    "VB": (
+        "MRP type: Reorder point planning."
+    ),
+
+    "ND": (
+        "MRP type: No planning."
+    ),
+
+    "F": (
+        "Procurement type: External procurement."
+    ),
+
+    "E": (
+        "Procurement type: In-house production."
+    ),
+
+    "X": (
+        "Procurement type: Both external and in-house "
+        "procurement allowed."
+    ),
+
+    "S": (
+        "Price control: Standard price."
+    ),
+
+    "V": (
+        "Price control: Moving average price."
+    ),
 }
 
 
 # ============================================================
-# TEXT / RESPONSE HELPERS
+# GROUNDING CHECK FOR create_material FIELDS
+# ============================================================
+#
+# The planner LLM is told never to invent material_type,
+# material_group, or base_unit. Small models don't reliably follow
+# that instruction on their own (e.g. guessing material_type "FERT"
+# for "create a pump in plant 1000" purely from domain priors, with
+# nothing in the message actually saying so). This section is a
+# deterministic backstop: before a create_material decision is
+# trusted, each of these fields must be traceable to something the
+# user actually typed, or it's dropped and treated as missing.
+
+MATERIAL_TYPE_KEYWORDS: Dict[str, set[str]] = {
+    "FERT": {
+        "finished",
+        "finished good",
+        "finished goods",
+        "finished product",
+        "finished material",
+    },
+    "HALB": {
+        "semi finished",
+        "semifinished",
+        "half finished",
+    },
+    "ROH": {
+        "raw material",
+        "raw materials",
+    },
+    "HAWA": {
+        "trading good",
+        "trading goods",
+        "trading material",
+        "resale",
+        "resell",
+    },
+    "DIEN": {
+        "service",
+        "services",
+    },
+    "VERP": {
+        "packaging",
+        "packaging material",
+    },
+}
+
+
+def message_supports_material_type(
+    message: str,
+    type_code: Any,
+) -> bool:
+    """
+    True only if the material type code itself, or one of its
+    recognized synonym phrases, actually appears in the user's
+    message -- never true purely because the model inferred it.
+    """
+
+    normalized_message = normalize_text(message)
+    code = str(type_code or "").strip().upper()
+
+    if not code:
+        return False
+
+    if re.search(
+        rf"\b{re.escape(code.lower())}\b",
+        normalized_message,
+    ):
+        return True
+
+    for keyword in MATERIAL_TYPE_KEYWORDS.get(code, ()):
+        if normalize_text(keyword) in normalized_message:
+            return True
+
+    return False
+
+
+def message_supports_literal_value(
+    message: str,
+    value: Any,
+) -> bool:
+    """
+    True only if the exact value appears as a whole word/phrase in
+    the user's message. Used for fields with no fixed vocabulary
+    to map synonyms from (material_group, base_unit).
+    """
+
+    if value is None:
+        return False
+
+    normalized_message = normalize_text(message)
+    normalized_value = normalize_text(value)
+
+    if not normalized_value:
+        return False
+
+    return bool(
+        re.search(
+            rf"\b{re.escape(normalized_value)}\b",
+            normalized_message,
+        )
+    )
+
+
+def strip_ungrounded_create_fields(
+    decision: Dict[str, Any],
+    message: str,
+) -> Dict[str, Any]:
+    """
+    Drop any material_type / material_group / base_unit the planner
+    returned but that isn't actually grounded in the user's message,
+    so the missing-field flow triggers instead of silently creating
+    a material with guessed attributes.
+
+    material_description and plant are intentionally excluded here:
+    description is expected to be the user's own free text (not a
+    fixed-vocabulary code), and plant is already validated numerically
+    by normalize_plant.
+    """
+
+    cleaned = dict(decision)
+
+    material_type = cleaned.get("material_type")
+    if material_type and not message_supports_material_type(
+        message,
+        material_type,
+    ):
+        print("BLOCKED UNGROUNDED material_type GUESS:", material_type)
+        cleaned["material_type"] = None
+
+    material_group = cleaned.get("material_group")
+    if material_group and not message_supports_literal_value(
+        message,
+        material_group,
+    ):
+        print("BLOCKED UNGROUNDED material_group GUESS:", material_group)
+        cleaned["material_group"] = None
+
+    base_unit = cleaned.get("base_unit")
+    if base_unit and not message_supports_literal_value(
+        message,
+        base_unit,
+    ):
+        print("BLOCKED UNGROUNDED base_unit GUESS:", base_unit)
+        cleaned["base_unit"] = None
+
+    return cleaned
+
+
+# ============================================================
+# TEXT HELPERS
 # ============================================================
 
-def normalize_text(value: Any) -> str:
+def normalize_text(
+    value: Any,
+) -> str:
     """
-    Normalize text for matching user responses and
-    material descriptions.
+    Normalize text for comparisons.
     """
+
     if value is None:
         return ""
 
@@ -291,12 +448,15 @@ def normalize_text(value: Any) -> str:
         r"\s+",
         " ",
         text,
-    ).strip()
+    )
 
-    return text
+    return text.strip()
 
 
-def is_yes(message: str) -> bool:
+def is_yes(
+    message: str,
+) -> bool:
+
     normalized = normalize_text(message)
 
     return (
@@ -305,7 +465,10 @@ def is_yes(message: str) -> bool:
     )
 
 
-def is_no(message: str) -> bool:
+def is_no(
+    message: str,
+) -> bool:
+
     normalized = normalize_text(message)
 
     return (
@@ -314,29 +477,521 @@ def is_no(message: str) -> bool:
     )
 
 
-def is_cancel(message: str) -> bool:
+def is_cancel(
+    message: str,
+) -> bool:
+
     normalized = normalize_text(message)
 
     return normalized in CANCEL_RESPONSES
 
 
 # ============================================================
-# MATERIAL FIELD HELPERS
+# SEARCH PARAMETER SANITIZATION
 # ============================================================
+
+def clean_optional_value(
+    value: Any,
+    invalid_values: set[str],
+) -> str | None:
+    """
+    Remove empty and hallucinated placeholder values produced
+    by the small planner model.
+    """
+
+    if value is None:
+        return None
+
+    cleaned = str(value).strip()
+
+    if not cleaned:
+        return None
+
+    invalid_normalized = {
+        normalize_text(item)
+        for item in invalid_values
+    }
+
+    if normalize_text(cleaned) in invalid_normalized:
+        return None
+
+    return cleaned
+
+
+def singularize_search_word(
+    word: str,
+) -> str:
+    """
+    Very conservative search singularization.
+
+    This solves searches such as:
+        pumps   -> pump
+        valves  -> valve
+        sensors -> sensor
+
+    We intentionally avoid trying to implement a complete
+    English stemming algorithm.
+    """
+
+    lower = word.lower()
+
+    # ies -> y
+    # batteries -> battery
+    if (
+        len(word) > 4
+        and lower.endswith("ies")
+    ):
+        return word[:-3] + "y"
+
+    # ses / xes / zes / ches / shes
+    # boxes -> box
+    if (
+        lower.endswith("ses")
+        or lower.endswith("xes")
+        or lower.endswith("zes")
+        or lower.endswith("ches")
+        or lower.endswith("shes")
+    ):
+        return word[:-2]
+
+    # ordinary plural
+    if (
+        len(word) > 3
+        and lower.endswith("s")
+        and not lower.endswith("ss")
+    ):
+        return word[:-1]
+
+    return word
+
+
+def normalize_search_query(
+    value: Any,
+) -> str | None:
+    """
+    Convert planner q output into a safe database search term.
+
+    Examples:
+
+    pumps
+        -> pump
+
+    Material Description
+        -> None
+
+    database
+        -> None
+    """
+
+    q = clean_optional_value(
+        value,
+        {
+            "material",
+            "materials",
+            "material description",
+            "description",
+            "database",
+            "the database",
+            "material database",
+            "material master",
+            "material master database",
+            "all materials",
+            "all material",
+            "search term",
+            "search query",
+            "query",
+            "none",
+            "null",
+            "n/a",
+        },
+    )
+
+    if not q:
+        return None
+
+    words = q.split()
+
+    # Only singularize single-word searches.
+    if len(words) == 1:
+        q = singularize_search_word(q)
+
+    return q
+
+
+def normalize_plant(
+    value: Any,
+) -> str | None:
+    """
+    Validate plant codes generated by the planner.
+
+    Prototype plant values are numeric SAP plant codes.
+    """
+
+    plant = clean_optional_value(
+        value,
+        {
+            "plant",
+            "plant number",
+            "plant code",
+            "plant id",
+            "number",
+            "none",
+            "null",
+            "n/a",
+        },
+    )
+
+    if not plant:
+        return None
+
+    # Don't allow Qwen text such as "Plant Number"
+    # to reach the database.
+    if not plant.isdigit():
+        print(
+            "BLOCKED INVALID PLANT VALUE:",
+            plant,
+        )
+
+        return None
+
+    return plant
+
+
+def normalize_material_type(
+    value: Any,
+) -> str | None:
+
+    material_type = clean_optional_value(
+        value,
+        {
+            "material type",
+            "type",
+            "none",
+            "null",
+            "n/a",
+        },
+    )
+
+    if not material_type:
+        return None
+
+    return material_type.upper()
+
+
+def normalize_material_group(
+    value: Any,
+) -> str | None:
+
+    material_group = clean_optional_value(
+        value,
+        {
+            "material group",
+            "group",
+            "none",
+            "null",
+            "n/a",
+        },
+    )
+
+    if not material_group:
+        return None
+
+    return material_group.upper()
+
+
+def normalize_search_decision(
+    decision: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Sanitize every parameter before an MCP search.
+
+    The LLM decides intent.
+
+    Python decides what values are safe enough to send
+    to the database.
+    """
+
+    normalized = {
+        "q": normalize_search_query(
+            decision.get("q")
+        ),
+
+        "plant": normalize_plant(
+            decision.get("plant")
+        ),
+
+        "material_type": normalize_material_type(
+            decision.get("material_type")
+        ),
+
+        "material_group": normalize_material_group(
+            decision.get("material_group")
+        ),
+    }
+
+    print(
+        "NORMALIZED SEARCH:",
+        normalized,
+    )
+
+    return normalized
+
+
+# ============================================================
+# BASIC SAFETY HELPERS
+# ============================================================
+
+def is_obviously_off_topic(
+    message: str,
+) -> bool:
+
+    normalized = normalize_text(message)
+
+    if (
+        "material" in normalized
+        or "sap" in normalized
+    ):
+        return False
+
+    return any(
+        term in normalized
+        for term in OBVIOUS_OFF_TOPIC_TERMS
+    )
+
+
+def extract_material_number(
+    message: str,
+):
+
+    match = MATERIAL_NUMBER_PATTERN.search(
+        message.upper()
+    )
+
+    return (
+        match.group(0)
+        if match
+        else None
+    )
+
+
+def extract_json_object(
+    text: str,
+) -> dict:
+    """
+    Read the first valid JSON object returned by Qwen.
+    """
+
+    decoder = json.JSONDecoder()
+
+    start = text.find("{")
+
+    if start == -1:
+        raise ValueError(
+            "No JSON object found in planner output."
+        )
+
+    obj, _ = decoder.raw_decode(
+        text,
+        start,
+    )
+
+    if not isinstance(
+        obj,
+        dict,
+    ):
+        raise ValueError(
+            "Planner output was not a JSON object."
+        )
+
+    return obj
+
+
+def strip_browsing_claims(
+    text: str,
+) -> str:
+
+    if BROWSING_CLAIM_PATTERN.search(
+        text
+    ):
+
+        return (
+            "I can only answer using SAP MM Material Master "
+            "data and definitions available to me directly. "
+            "I don't browse the internet or use external sources."
+        )
+
+    return text
+
+
+def sweep_expired_pending_creations(
+    pending_creations: dict,
+) -> None:
+
+    now = time.time()
+
+    expired = [
+        session_id
+        for session_id, entry
+        in pending_creations.items()
+        if (
+            now
+            - entry.get(
+                "_created_at",
+                now,
+            )
+            > PENDING_CREATION_TTL_SECONDS
+        )
+    ]
+
+    for session_id in expired:
+
+        del pending_creations[
+            session_id
+        ]
+
+
+def extract_excluded_currency(message: str) -> str | None:
+    """Recognize a high-confidence 'currency other than X' comparison."""
+    normalized = normalize_text(message)
+    if "currency" not in normalized or not any(
+        word in normalized.split() for word in {"other", "different", "non"}
+    ):
+        return None
+    match = re.search(r"\b(?:than|from)\s+([a-z]{3})\b", normalized)
+    if match:
+        return match.group(1).upper()
+    codes = re.findall(r"\b[A-Z]{3}\b", message)
+    return codes[-1] if codes else None
+
+
+def is_previous_search_follow_up(message: str) -> bool:
+    normalized = normalize_text(message)
+    phrases = {
+        "searched before", "previous search", "last search",
+        "previous material", "last material", "earlier material",
+    }
+    return any(phrase in normalized for phrase in phrases)
+
+
+def remember_query_context(
+    session_contexts: dict,
+    session_id: str,
+    request: str,
+    reply: str,
+    found_results: bool,
+) -> None:
+    context = session_contexts.setdefault(session_id, {})
+    context["last_query"] = {"request": request, "reply": reply}
+    if found_results:
+        context["last_successful_query"] = {"request": request, "reply": reply}
+
+
+# Phrases that signal "continue from what we were just discussing"
+# rather than "start a brand new, unrelated search."
+CONTINUITY_CUES = {
+    "relevant", "similar", "those", "these", "them", "related",
+    "same", "matching", "match", "ones", "one",
+}
+
+
+def message_has_continuity_cue(message: str) -> bool:
+    normalized = set(normalize_text(message).split())
+    return bool(normalized & CONTINUITY_CUES)
+
+
+def remember_search_entities(
+    session_contexts: dict,
+    session_id: str,
+    entities: Dict[str, Any],
+) -> None:
+    """
+    Slot-filling working memory for the last search's entities
+    (q/search_text, plant, material_type, material_group).
+
+    Only overwrites a slot when the new turn actually supplies a
+    value, so a follow-up turn that omits a field (e.g. restates
+    only the plant) doesn't erase what was learned earlier in the
+    session.
+    """
+
+    context = session_contexts.setdefault(session_id, {})
+    stored = context.setdefault("last_search_entities", {})
+
+    for key, value in entities.items():
+        if value:
+            stored[key] = value
+
+
+def get_last_search_entities(
+    session_contexts: dict,
+    session_id: str,
+) -> Dict[str, Any]:
+    return session_contexts.get(session_id, {}).get(
+        "last_search_entities",
+        {},
+    )
+
+
+# ============================================================
+# MATERIAL VALUE HELPERS
+# ============================================================
+
+def unwrap_material(
+    material: Any,
+) -> Any:
+    """
+    explain_material_master may return:
+
+    {
+        "material": {...},
+        "code_meanings": {...}
+    }
+
+    This helper returns the inner material when necessary.
+    """
+
+    if not isinstance(
+        material,
+        dict,
+    ):
+        return material
+
+    inner = material.get(
+        "material"
+    )
+
+    if (
+        isinstance(inner, dict)
+        and (
+            "material" in inner
+            or "material_description" in inner
+        )
+    ):
+        return inner
+
+    return material
+
 
 def get_material_value(
     material: Dict[str, Any],
     *keys: str,
 ) -> Any:
-    """
-    Read a material field while supporting different naming
-    styles returned by the MCP server or CSV.
-    """
+
+    if not isinstance(
+        material,
+        dict,
+    ):
+        return None
 
     for key in keys:
+
         if (
             key in material
-            and material[key] not in (None, "")
+            and material[key]
+            not in (
+                None,
+                "",
+            )
         ):
             return material[key]
 
@@ -344,31 +999,34 @@ def get_material_value(
 
 
 # ============================================================
-# SIMILARITY ENGINE
+# MATERIAL SIMILARITY
 # ============================================================
 
 def description_similarity(
     requested: str,
     existing: str,
 ) -> float:
-    """
-    Return a description similarity score from 0.0 to 1.0.
-    """
 
-    requested_norm = normalize_text(requested)
-    existing_norm = normalize_text(existing)
+    requested_norm = normalize_text(
+        requested
+    )
 
-    if not requested_norm or not existing_norm:
+    existing_norm = normalize_text(
+        existing
+    )
+
+    if (
+        not requested_norm
+        or not existing_norm
+    ):
         return 0.0
 
-    # General text sequence similarity.
     sequence_score = SequenceMatcher(
         None,
         requested_norm,
         existing_norm,
     ).ratio()
 
-    # Token-based word overlap.
     requested_tokens = set(
         requested_norm.split()
     )
@@ -377,7 +1035,10 @@ def description_similarity(
         existing_norm.split()
     )
 
-    if requested_tokens and existing_tokens:
+    if (
+        requested_tokens
+        and existing_tokens
+    ):
 
         intersection = len(
             requested_tokens
@@ -395,14 +1056,25 @@ def description_similarity(
             else 0.0
         )
 
-    else:
-        token_score = 0.0
+        # How much of the REQUESTED description is fully covered by
+        # the existing one. Short, generic requests like "Pump" should
+        # score highly against "Precision Pump Assembly 001" even
+        # though SequenceMatcher/Jaccard penalize them for the length
+        # mismatch. Without this, brief descriptions can never trigger
+        # the duplicate check no matter how many real duplicates exist.
+        containment_score = (
+            intersection / len(requested_tokens)
+        )
 
-    # Description matching is based on both word overlap
-    # and general text similarity.
+    else:
+
+        token_score = 0.0
+        containment_score = 0.0
+
     score = (
-        sequence_score * 0.55
-        + token_score * 0.45
+        sequence_score * 0.20
+        + token_score * 0.30
+        + containment_score * 0.50
     )
 
     return min(
@@ -415,12 +1087,6 @@ def score_material_similarity(
     proposal: Dict[str, Any],
     material: Dict[str, Any],
 ) -> float:
-    """
-    Score a REAL existing material against a proposed
-    new material.
-
-    The LLM does NOT determine this score.
-    """
 
     existing_description = get_material_value(
         material,
@@ -430,7 +1096,7 @@ def score_material_similarity(
         "Description",
     )
 
-    base_description_score = description_similarity(
+    base_score = description_similarity(
         proposal.get(
             "material_description",
             "",
@@ -441,13 +1107,11 @@ def score_material_similarity(
         ),
     )
 
-    # Description is the primary duplicate indicator.
     score = (
-        base_description_score
+        base_score
         * 0.82
     )
 
-    # Attribute matches boost confidence.
     comparisons = [
         (
             proposal.get(
@@ -460,6 +1124,7 @@ def score_material_similarity(
             ),
             0.07,
         ),
+
         (
             proposal.get(
                 "material_group"
@@ -471,6 +1136,7 @@ def score_material_similarity(
             ),
             0.05,
         ),
+
         (
             proposal.get(
                 "base_unit"
@@ -482,6 +1148,7 @@ def score_material_similarity(
             ),
             0.03,
         ),
+
         (
             proposal.get(
                 "plant"
@@ -523,10 +1190,10 @@ def normalize_material_for_display(
     material: Dict[str, Any],
     similarity_score: float,
 ) -> Dict[str, Any]:
-    """
-    Normalize a real MCP material result into a predictable
-    structure for display.
-    """
+
+    material = unwrap_material(
+        material
+    )
 
     return {
         "material_number": get_material_value(
@@ -615,14 +1282,6 @@ def normalize_material_for_display(
 async def find_similar_materials(
     proposal: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """
-    Mandatory duplicate check.
-
-    This function searches REAL material records and performs
-    similarity scoring in Python.
-
-    Material creation cannot bypass this function.
-    """
 
     print(
         "ACTION: Mandatory duplicate/similarity check"
@@ -630,17 +1289,19 @@ async def find_similar_materials(
 
     try:
 
-        # Search materials from the requested plant.
-        #
-        # We intentionally do not supply q here because an
-        # exact text search could miss similar wording.
-        candidates = await search_material_master(
-            q=None,
-            plant=proposal.get(
-                "plant"
-            ),
-            material_type=None,
-            material_group=None,
+        candidates = (
+            await search_material_master(
+                q=None,
+
+                plant=normalize_plant(
+                    proposal.get(
+                        "plant"
+                    )
+                ),
+
+                material_type=None,
+                material_group=None,
+            )
         )
 
     except Exception as exc:
@@ -653,6 +1314,7 @@ async def find_similar_materials(
         raise
 
     if not candidates:
+
         return []
 
     scored_matches: List[
@@ -697,32 +1359,414 @@ async def find_similar_materials(
 
 
 # ============================================================
-# MATERIAL CREATION DISPLAY
+# FORMAT SEARCH RESULTS
+# ============================================================
+
+def format_search_results(
+    message: str,
+    materials,
+) -> str:
+
+    if not materials:
+
+        return (
+            "I couldn't find any matching materials."
+        )
+
+    # Some MCP responses may contain one nested list.
+    if (
+        isinstance(materials, list)
+        and len(materials) == 1
+        and isinstance(
+            materials[0],
+            list,
+        )
+    ):
+        materials = materials[0]
+
+    if isinstance(
+        materials,
+        dict,
+    ):
+
+        materials = [
+            materials
+        ]
+
+    lines = [
+        f"I found {len(materials)} matching material"
+        + (
+            ""
+            if len(materials) == 1
+            else "s"
+        )
+        + ":",
+        "",
+    ]
+
+    valid_count = 0
+
+    for material in materials:
+
+        if not isinstance(
+            material,
+            dict,
+        ):
+            continue
+
+        material = unwrap_material(
+            material
+        )
+
+        number = get_material_value(
+            material,
+            "material",
+            "Material",
+            "material_number",
+            "MaterialNumber",
+        )
+
+        description = get_material_value(
+            material,
+            "material_description",
+            "MaterialDescription",
+            "description",
+            "Description",
+        )
+
+        material_type = get_material_value(
+            material,
+            "material_type",
+            "MaterialType",
+        )
+
+        plant = get_material_value(
+            material,
+            "plant",
+            "Plant",
+        )
+
+        price = get_material_value(
+            material,
+            "standard_price",
+            "StandardPrice",
+        )
+
+        currency = get_material_value(
+            material,
+            "currency",
+            "Currency",
+        )
+
+        valid_count += 1
+
+        lines.append(
+            f"• {number} — {description}\n"
+            f"  Type: {material_type} | "
+            f"Plant: {plant} | "
+            f"Price: {price} {currency or ''}".rstrip()
+        )
+
+    if valid_count == 0:
+
+        return (
+            "The material search completed, but I couldn't "
+            "read the returned material records."
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+def format_query_results(result: Any) -> str:
+    """Format deterministic query output without asking the LLM to reinterpret it."""
+    if not isinstance(result, dict):
+        return "The material query completed, but returned an unreadable response."
+    if result.get("kind") == "aggregate":
+        aggregate = result.get("aggregate", {})
+        label = aggregate.get("function", "result")
+        field = aggregate.get("field")
+        rows = result.get("rows")
+        if isinstance(rows, list):
+            if not rows:
+                return "I couldn't find any matching materials."
+            group_by = aggregate.get("group_by")
+            lines = [f"{label.title()} {field or 'materials'} by {group_by}:", ""]
+            lines.extend(f"• {row.get(group_by)}: {row.get('value')}" for row in rows)
+            return "\n".join(lines)
+        return f"{label.title()} {field or 'materials'}: {result.get('value')}"
+    return format_search_results("", result.get("items", []))
+
+
+# ============================================================
+# FORMAT ONE MATERIAL
+# ============================================================
+
+def format_material(
+    message: str,
+    material,
+) -> str:
+
+    if not material:
+
+        return (
+            "I couldn't find that material."
+        )
+
+    wrapper = (
+        material
+        if isinstance(
+            material,
+            dict,
+        )
+        else {}
+    )
+
+    code_meanings = wrapper.get(
+        "code_meanings",
+        {},
+    )
+
+    material = unwrap_material(
+        material
+    )
+
+    if not isinstance(
+        material,
+        dict,
+    ):
+
+        return (
+            "I couldn't read the returned material record."
+        )
+
+    def explain(
+        code,
+    ):
+
+        if not code:
+            return code
+
+        # MCP may supply meanings in different structures.
+        if isinstance(
+            code_meanings,
+            dict,
+        ):
+
+            if code in code_meanings:
+                meaning = code_meanings[
+                    code
+                ]
+
+                if isinstance(
+                    meaning,
+                    str,
+                ):
+                    return (
+                        f"{code} ({meaning})"
+                    )
+
+        if code in SAP_CODE_GLOSSARY:
+
+            return (
+                f"{code} "
+                f"({SAP_CODE_GLOSSARY[code]})"
+            )
+
+        return code
+
+    material_type = get_material_value(
+        material,
+        "material_type",
+        "MaterialType",
+    )
+
+    procurement_type = get_material_value(
+        material,
+        "procurement_type",
+        "ProcurementType",
+    )
+
+    mrp_type = get_material_value(
+        material,
+        "mrp_type",
+        "MRPType",
+    )
+
+    price_control = get_material_value(
+        material,
+        "price_control",
+        "PriceControl",
+    )
+
+    lines = [
+        (
+            "Material Number: "
+            + str(
+                get_material_value(
+                    material,
+                    "material",
+                    "Material",
+                    "material_number",
+                    "MaterialNumber",
+                )
+            )
+        ),
+
+        (
+            "Description: "
+            + str(
+                get_material_value(
+                    material,
+                    "material_description",
+                    "MaterialDescription",
+                    "description",
+                    "Description",
+                )
+            )
+        ),
+
+        (
+            "Material Type: "
+            + str(
+                explain(
+                    material_type
+                )
+            )
+        ),
+
+        (
+            "Material Group: "
+            + str(
+                get_material_value(
+                    material,
+                    "material_group",
+                    "MaterialGroup",
+                )
+            )
+        ),
+
+        (
+            "Base Unit: "
+            + str(
+                get_material_value(
+                    material,
+                    "base_unit",
+                    "BaseUnit",
+                )
+            )
+        ),
+
+        (
+            "Plant: "
+            + str(
+                get_material_value(
+                    material,
+                    "plant",
+                    "Plant",
+                )
+            )
+        ),
+
+        (
+            "Procurement Type: "
+            + str(
+                explain(
+                    procurement_type
+                )
+            )
+        ),
+
+        (
+            "MRP Type: "
+            + str(
+                explain(
+                    mrp_type
+                )
+            )
+        ),
+
+        (
+            "Valuation Class: "
+            + str(
+                get_material_value(
+                    material,
+                    "valuation_class",
+                    "ValuationClass",
+                )
+            )
+        ),
+
+        (
+            "Price Control: "
+            + str(
+                explain(
+                    price_control
+                )
+            )
+        ),
+
+        (
+            "Standard Price: "
+            + str(
+                get_material_value(
+                    material,
+                    "standard_price",
+                    "StandardPrice",
+                )
+            )
+        ),
+
+        (
+            "Currency: "
+            + str(
+                get_material_value(
+                    material,
+                    "currency",
+                    "Currency",
+                )
+            )
+        ),
+    ]
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# CREATE MATERIAL DISPLAY
 # ============================================================
 
 def format_creation_preview(
     proposal: Dict[str, Any],
 ) -> str:
-    """
-    Show the proposed material before final creation.
-    """
 
     return (
         "I'm ready to create this material:\n\n"
+
         f"Description: "
         f"{proposal['material_description']}\n"
+
         f"Material Type: "
         f"{proposal['material_type']}\n"
+
         f"Material Group: "
         f"{proposal['material_group']}\n"
+
         f"Base Unit: "
         f"{proposal['base_unit']}\n"
+
         f"Plant: "
         f"{proposal['plant']}\n"
+
         f"Standard Price: "
         f"{proposal.get('standard_price')}\n"
+
         f"Currency: "
         f"{proposal.get('currency')}\n\n"
+
         "Reply 'yes' to confirm creation or "
         "'cancel' to stop."
     )
@@ -731,10 +1775,6 @@ def format_creation_preview(
 def format_similar_material_prompt(
     matches: List[Dict[str, Any]],
 ) -> str:
-    """
-    Display the closest existing material before allowing
-    creation to continue.
-    """
 
     best_match = matches[0]
 
@@ -795,15 +1835,21 @@ def format_similar_material_prompt(
         "'no' to continue creating a new material."
     )
 
-    if len(matches) > 1:
+    if len(
+        matches
+    ) > 1:
 
-        response += (
-            f"\n\nI found "
-            f"{len(matches) - 1} "
-            "additional potentially similar material"
+        additional = (
+            len(matches)
+            - 1
         )
 
-        if len(matches) > 2:
+        response += (
+            f"\n\nI found {additional} additional "
+            "potentially similar material"
+        )
+
+        if additional > 1:
             response += "s"
 
         response += "."
@@ -814,13 +1860,10 @@ def format_similar_material_prompt(
 def format_existing_material_selected(
     material: Dict[str, Any],
 ) -> str:
-    """
-    Response when the user confirms that the existing
-    material is the one they need.
-    """
 
     return (
         "Understood. I will not create a new material.\n\n"
+
         "The existing material is:\n\n"
 
         f"Material Number: "
@@ -843,6 +1886,234 @@ def format_existing_material_selected(
     )
 
 
+def format_create_result(
+    result,
+) -> str:
+
+    if not result:
+
+        return (
+            "The material creation request returned no result."
+        )
+
+    if not isinstance(
+        result,
+        dict,
+    ):
+
+        return (
+            "The material creation request returned an "
+            "unexpected response."
+        )
+
+    status = result.get(
+        "status"
+    )
+
+    # MCP wrapper may contain another material API result.
+    if (
+        not status
+        and isinstance(
+            result.get("material"),
+            dict,
+        )
+    ):
+
+        nested = result.get(
+            "material"
+        )
+
+        if "status" in nested:
+
+            result = nested
+
+            status = result.get(
+                "status"
+            )
+
+    if (
+        status
+        == "VALIDATION_FAILED"
+    ):
+
+        errors = result.get(
+            "errors",
+            [],
+        )
+
+        if not errors:
+
+            return (
+                "Material creation failed validation."
+            )
+
+        return (
+            "Material creation failed validation:\n\n"
+            + "\n".join(
+                f"- {error}"
+                for error
+                in errors
+            )
+        )
+
+    if (
+        status
+        == "CREATED"
+    ):
+
+        payload = result.get(
+            "material",
+            {},
+        )
+
+        # Material API currently returns:
+        #
+        # {
+        #   "status": "CREATED",
+        #   "material": {...}
+        # }
+        #
+        # and MCP can wrap that again.
+        if (
+            isinstance(
+                payload,
+                dict,
+            )
+            and payload.get(
+                "status"
+            )
+            == "CREATED"
+        ):
+
+            payload = payload.get(
+                "material",
+                {},
+            )
+
+        if (
+            isinstance(
+                payload,
+                dict,
+            )
+            and isinstance(
+                payload.get("material"),
+                dict,
+            )
+        ):
+
+            payload = payload.get(
+                "material"
+            )
+
+        material = (
+            payload
+            if isinstance(
+                payload,
+                dict,
+            )
+            else {}
+        )
+
+        return (
+            "Material created successfully.\n\n"
+
+            f"Material Number: "
+            f"{material.get('material')}\n"
+
+            f"Description: "
+            f"{material.get('material_description')}\n"
+
+            f"Material Type: "
+            f"{material.get('material_type')}\n"
+
+            f"Plant: "
+            f"{material.get('plant')}\n"
+
+            f"Procurement Type: "
+            f"{material.get('procurement_type')}\n"
+
+            f"MRP Type: "
+            f"{material.get('mrp_type')}\n"
+
+            f"Valuation Class: "
+            f"{material.get('valuation_class')}\n"
+
+            f"Price Control: "
+            f"{material.get('price_control')}\n"
+
+            f"Standard Price: "
+            f"{material.get('standard_price')}\n"
+
+            f"Currency: "
+            f"{material.get('currency')}"
+        )
+
+    return (
+        "The material creation request completed, "
+        "but the returned status was not recognized."
+    )
+
+
+# ============================================================
+# GENERIC SAP MM ANSWERS
+# ============================================================
+
+async def generate_sap_mm_answer(
+    message: str,
+) -> str:
+
+    normalized = normalize_text(
+        message
+    )
+
+    # Try deterministic glossary first.
+    for (
+        code,
+        meaning,
+    ) in SAP_CODE_GLOSSARY.items():
+
+        if re.search(
+            rf"\b{re.escape(code.lower())}\b",
+            normalized,
+        ):
+
+            return (
+                f"{code}: {meaning}"
+            )
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+You are strictly restricted to SAP MM Material Master.
+
+User question:
+
+{message}
+
+Rules:
+
+- Answer only SAP MM Material Master questions.
+- Do not browse the internet.
+- Do not claim that you searched the internet.
+- Do not invent company-specific configuration.
+- If you do not know something, say so.
+- Keep the answer concise and factual.
+
+Assistant:
+"""
+
+    answer = await generate_async(
+        prompt,
+        max_new_tokens=250,
+        do_sample=False,
+        repetition_penalty=1.1,
+    )
+
+    return strip_browsing_claims(
+        answer
+    )
+
+
 # ============================================================
 # MAIN AGENT
 # ============================================================
@@ -851,19 +2122,23 @@ async def run_agent(
     message: str,
     session_id: str,
     pending_creations: dict,
+    session_contexts: dict | None = None,
 ) -> str:
 
-    # Drop any abandoned material-creation flows before doing
-    # anything else, so pending_creations doesn't grow unbounded.
-    sweep_expired_pending_creations(pending_creations)
+    if session_contexts is None:
+        session_contexts = {}
 
-    # ========================================================
-    # HANDLE EXISTING MATERIAL CREATION WORKFLOW
-    # ========================================================
+    sweep_expired_pending_creations(
+        pending_creations
+    )
 
     normalized = normalize_text(
         message
     )
+
+    # ========================================================
+    # EXISTING MATERIAL CREATION WORKFLOW
+    # ========================================================
 
     if (
         session_id
@@ -880,7 +2155,7 @@ async def run_agent(
         )
 
         # ----------------------------------------------------
-        # SIMILAR MATERIAL CONFIRMATION
+        # SIMILAR MATERIAL FOUND
         # ----------------------------------------------------
 
         if (
@@ -888,7 +2163,9 @@ async def run_agent(
             == STAGE_SIMILARITY_CONFIRMATION
         ):
 
-            if is_cancel(message):
+            if is_cancel(
+                message
+            ):
 
                 del pending_creations[
                     session_id
@@ -898,9 +2175,9 @@ async def run_agent(
                     "Material creation cancelled."
                 )
 
-            # YES means:
-            # Existing material is what the user wants.
-            if is_yes(message):
+            if is_yes(
+                message
+            ):
 
                 best_match = pending.get(
                     "best_match",
@@ -917,22 +2194,23 @@ async def run_agent(
                     )
                 )
 
-            # NO means:
-            # User wants to continue creating a NEW material.
-            if is_no(message):
+            if is_no(
+                message
+            ):
 
                 proposal = pending[
                     "proposal"
                 ]
 
-                # Move to separate creation confirmation.
                 pending_creations[
                     session_id
                 ] = {
                     "_stage":
                         STAGE_CREATION_CONFIRMATION,
+
                     "_created_at":
                         time.time(),
+
                     **proposal,
                 }
 
@@ -949,7 +2227,7 @@ async def run_agent(
             )
 
         # ----------------------------------------------------
-        # FINAL NEW MATERIAL CONFIRMATION
+        # FINAL CREATION CONFIRMATION
         # ----------------------------------------------------
 
         if (
@@ -958,7 +2236,9 @@ async def run_agent(
         ):
 
             if (
-                is_yes(message)
+                is_yes(
+                    message
+                )
                 or normalized
                 in {
                     "create",
@@ -970,14 +2250,6 @@ async def run_agent(
                     "FINAL CREATION CONFIRMATION RECEIVED"
                 )
 
-                # This stage can only be reached after:
-                #
-                # 1. No similar material was found
-                #
-                # OR
-                #
-                # 2. The user explicitly rejected the
-                #    existing material.
                 result = (
                     await create_material_master(
                         material_description=
@@ -1022,13 +2294,19 @@ async def run_agent(
                     session_id
                 ]
 
-                return format_create_result(
-                    result
+                return (
+                    format_create_result(
+                        result
+                    )
                 )
 
             if (
-                is_no(message)
-                or is_cancel(message)
+                is_no(
+                    message
+                )
+                or is_cancel(
+                    message
+                )
             ):
 
                 del pending_creations[
@@ -1043,10 +2321,6 @@ async def run_agent(
                 "A material is waiting for creation confirmation. "
                 "Reply 'yes' to create it or 'cancel' to stop."
             )
-
-        # ----------------------------------------------------
-        # UNKNOWN WORKFLOW STATE
-        # ----------------------------------------------------
 
         print(
             "BLOCKED UNKNOWN PENDING STAGE:",
@@ -1064,194 +2338,412 @@ async def run_agent(
         )
 
     # ========================================================
-    # DETERMINISTIC FAST PATHS (no model call)
-    #
-    # These handle the unambiguous cases directly in Python. This
-    # both saves an LLM round trip and gives a hard guarantee — not
-    # dependent on the model's classification — that obviously
-    # off-topic messages never reach a generation step, and that an
-    # explicit material-number lookup is never misrouted.
+    # DETERMINISTIC FAST PATHS
     # ========================================================
 
-    if is_obviously_off_topic(message):
+    if is_previous_search_follow_up(message):
+        context = session_contexts.get(session_id, {})
+        last_query = context.get("last_query")
+        last_success = context.get("last_successful_query")
+        if not last_query:
+            return "There is no previous material search in this session."
+        if last_success and last_success != last_query:
+            return (
+                f"Your most recent query was: “{last_query['request']}”\n"
+                f"{last_query['reply']}\n\n"
+                f"The most recent successful search was: “{last_success['request']}”\n"
+                f"{last_success['reply']}"
+            )
+        return (
+            f"Your most recent material search was: “{last_query['request']}”\n"
+            f"{last_query['reply']}"
+        )
 
-        print("ACTION: Rejected via deterministic off-topic filter")
+    excluded_currency = extract_excluded_currency(message)
+    if excluded_currency:
+        query_plan = validate_query_plan({
+            "filters": [{
+                "field": "currency",
+                "operator": "ne",
+                "value": excluded_currency,
+            }],
+            "sort": [{"field": "currency", "direction": "asc"}],
+            "limit": 20,
+        })
+        try:
+            result = await query_material_master(query_plan)
+        except Exception as exc:
+            print("ERROR: MCP currency query failed:", exc)
+            return "I couldn't query the material master because the material service is unavailable."
+        reply = format_query_results(result)
+        found = bool(result.get("items")) if isinstance(result, dict) else False
+        remember_query_context(session_contexts, session_id, message, reply, found)
+        return reply
+
+    if is_obviously_off_topic(
+        message
+    ):
+
+        print(
+            "ACTION: Rejected via deterministic off-topic filter"
+        )
 
         return OUT_OF_SCOPE_MESSAGE
 
-    fast_path_material_number = extract_material_number(message)
+    material_number = extract_material_number(
+        message
+    )
 
-    if fast_path_material_number and len(message.split()) <= 6:
+    if (
+        material_number
+        and len(
+            message.split()
+        )
+        <= 8
+    ):
 
         print(
-            "ACTION: Fast-path get_material:",
-            fast_path_material_number,
+            "ACTION: Fast-path material lookup:",
+            material_number,
         )
 
-        material = await explain_material_master(fast_path_material_number)
+        try:
 
-        return format_material(
-            message=message,
-            material=material,
+            material = (
+                await explain_material_master(
+                    material_number
+                )
+            )
+
+        except Exception as exc:
+
+            print(
+                "ERROR: Material lookup failed:",
+                exc,
+            )
+
+            return (
+                "I couldn't retrieve that material from "
+                "the material master."
+            )
+
+        return (
+            format_material(
+                message=message,
+                material=material,
+            )
         )
 
     # ========================================================
-    # RESTRICTED LLM PLANNER
+    # QWEN PLANNER
     # ========================================================
+
+    last_entities = get_last_search_entities(
+        session_contexts,
+        session_id,
+    )
+
+    if last_entities:
+        recent_context_block = (
+            "RECENT CONVERSATION CONTEXT:\n\n"
+            "The user's previous search in this session used: "
+            + json.dumps(last_entities)
+            + "\n\nIf the new request refers back to that topic without "
+            "repeating it explicitly (e.g. it says 'those materials', "
+            "'the relevant materials', or otherwise omits a keyword "
+            "shortly after discussing a specific material), reuse the "
+            "prior keyword/material_type/material_group. If the new "
+            "request clearly starts a different topic, ignore this "
+            "context.\n"
+        )
+    else:
+        recent_context_block = ""
 
     planner_prompt = f"""
-You are a STRICTLY RESTRICTED SAP MM Material Master agent.
+You are a STRICTLY RESTRICTED SAP MM Material Master routing agent.
 
-You are only allowed to help with SAP MM Material Master topics.
+Your ONLY job is to convert the user's request into one JSON action.
 
-ALLOWED SCOPE:
-- search material master records
-- list materials
-- retrieve material details
-- explain SAP MM material master fields
-- explain material type codes
-- explain procurement type codes
-- explain MRP type codes
-- explain price control codes
-- create material master records
-- validate material creation requests
-- ask for missing material creation information
+{recent_context_block}
+ALLOWED DOMAIN:
+
+- SAP MM Material Master
+- material searches
+- material details
+- material types
+- material groups
+- plants
+- base units
+- procurement types
+- MRP types
+- valuation classes
+- price controls
+- material creation
 
 OUT OF SCOPE:
+
 - weather
 - news
 - politics
+- elections
 - sports
 - entertainment
-- general programming
-- coding help
+- programming
+- coding
 - personal advice
 - medical questions
 - legal questions
 - financial advice
-- general knowledge
-- internet research
-- web browsing
+- general internet research
 - unrelated SAP modules
-- anything not directly related to SAP MM Material Master
 
-If the user asks anything outside the allowed scope,
-you MUST return:
+If a request is outside SAP MM Material Master:
 
 {{
   "action": "reject"
 }}
 
-Never answer an out-of-scope question.
 
-Available actions:
+AVAILABLE ACTIONS
+
 
 1. search_material
 
-Use when the user wants to:
+Use for:
 - find materials
-- search materials
 - list materials
-- search by description
+- search descriptions
 - search by plant
-- search by material type
-- search by material group
+- search by type
+- search by group
+
+Possible fields:
+
+q
+plant
+material_type
+material_group
+
+IMPORTANT SEARCH RULES:
+
+The q field must contain ONLY the useful material search word.
+
+Examples:
+
+"find pumps"
+q must be "pump", NOT "pumps".
+
+"show valves"
+q must be "valve".
+
+"give me a material from the database"
+q must be null.
+
+"show materials"
+q must be null.
+
+Never put these in q:
+
+"Material Description"
+"Description"
+"Database"
+"Material"
+"Materials"
+"Search Query"
+
+If the user did not specify a plant, omit plant or use null.
+
+Never invent a plant.
+
+Never return placeholder values such as:
+
+"Plant Number"
+"Plant Code"
+"Material Description"
 
 
-2. get_material
+2. query_materials
 
-Use when the user asks for one specific material
-and provides a material number such as:
+Use for analytical or ranked requests: price/stock/weight comparisons,
+cheapest/highest/top/bottom, thresholds, ranges, sorting, counts, averages,
+totals, minimums, maximums, or grouping.
 
-SYN-FG-000001
+Return a plan with this exact shape:
+
+{{
+  "action": "query_materials",
+  "query_plan": {{
+    "search_text": "pump",
+    "filters": [{{"field": "plant", "operator": "eq", "value": "1000"}}],
+    "sort": [{{"field": "standard_price", "direction": "asc"}}],
+    "limit": 1
+  }}
+}}
+
+Allowed fields:
+material, material_description, material_type, material_group, base_unit,
+old_material_number, division, plant, storage_location, purchasing_group,
+procurement_type, mrp_type, mrp_controller, lot_size, valuation_class,
+price_control, currency, weight_unit, volume_unit, profit_center,
+tax_classification, sales_status, created_on, batch_management,
+serial_number_profile, country_of_origin, standard_price,
+moving_average_price, price_unit, safety_stock, reorder_point,
+planned_delivery_time_days, gr_processing_time_days, gross_weight,
+net_weight, volume
+
+Allowed operators: eq, ne, gt, gte, lt, lte, contains, in.
+Allowed sort directions: asc, desc. Limit must be 1 through 100.
+Allowed aggregates: count, min, max, avg, sum. Optional group_by must be a
+text field. For prices, use standard_price unless the user explicitly asks
+for moving average price. Add a currency filter only if the user names one;
+never pretend to convert currencies.
+
+"expensive material" means sort standard_price descending and limit 1.
+"cheapest pump in plant 1000" means search_text pump, plant eq 1000,
+sort standard_price ascending, limit 1.
+"materials over $500" means standard_price gt 500 and currency eq USD.
+"highest standard price" means sort standard_price descending and limit 1.
+"currency other than USD" means currency ne USD. Do not put the words
+"currency", "other", or "USD" into search_text.
+
+Examples:
+
+User: materials over $500
+Response:
+{{
+  "action": "query_materials",
+  "query_plan": {{
+    "filters": [
+      {{"field": "standard_price", "operator": "gt", "value": 500}},
+      {{"field": "currency", "operator": "eq", "value": "USD"}}
+    ],
+    "limit": 20
+  }}
+}}
+
+User: highest standard price
+Response:
+{{
+  "action": "query_materials",
+  "query_plan": {{
+    "sort": [{{"field": "standard_price", "direction": "desc"}}],
+    "limit": 1
+  }}
+}}
 
 
-3. create_material
+3. get_material
 
-Use when the user wants to create a new material.
+Use when the user provides one specific material number.
 
-Required creation fields:
+Example:
 
-- material_description
-- material_type
-- material_group
-- base_unit
-- plant
-
-Optional:
-
-- standard_price
-- currency
+{{
+  "action": "get_material",
+  "material_number": "SYN-FG-000001"
+}}
 
 
-IMPORTANT FOR CREATE MATERIAL:
+4. create_material
 
-The backend performs a mandatory duplicate/similarity
-check against REAL material master records before
-creation confirmation.
+Required fields:
 
-You must NOT invent existing materials.
+material_description
+material_type
+material_group
+base_unit
+plant
 
-You must NOT invent similarity results.
+Optional fields:
 
-You must NOT skip or override the backend duplicate check.
+standard_price
+currency
 
-You must NOT tell the user that no duplicate exists.
-The backend makes that decision.
+Do not invent required values.
 
-
-4. need_information
-
-Use when the user wants to create a material
-but required information is missing.
+The backend performs the mandatory duplicate check.
 
 
-5. answer_sap_mm
+5. need_information
 
-Use only for SAP MM Material Master questions
-that do not require live database access.
+Use when the user wants to create a material but required
+creation information is missing.
 
 
-6. reject
+6. answer_sap_mm
+
+Use for SAP MM Material Master questions that do not require
+live material-master database access.
+
+
+7. reject
 
 Use for anything outside SAP MM Material Master.
 
 
-IMPORTANT:
+STRICT RULES:
 
-Do NOT invent missing creation values.
+Return exactly ONE JSON object.
 
-Do NOT browse the internet.
+Do not write any text after the JSON.
 
-Do NOT claim to search the web.
+Do not repeat the JSON.
 
-Do NOT answer unrelated questions.
+Do not use markdown.
 
-Do NOT create new actions.
+Do not use code fences.
 
-Do NOT claim that a material was created unless
-the backend creation function returned a successful
-CREATED status.
+Do not browse the internet.
 
-Return ONLY valid JSON.
+Do not invent database records.
 
-Do not include explanations.
-
-Do not include markdown.
-
-Do not include code fences.
+Do not invent missing values. For create_material, material_type,
+material_group, and base_unit must come only from words the user
+actually typed -- never guessed from real-world domain knowledge
+(e.g. assuming a pump is FERT). If not stated, treat as missing.
 
 
-Examples:
+EXAMPLES
 
 
 User:
-Find pump materials in plant 1000
+What are the pumps in plant 1000?
 
 Response:
 {{
   "action": "search_material",
-  "q": "Pump",
+  "q": "pump",
+  "plant": "1000"
+}}
+
+
+User:
+Find valves
+
+Response:
+{{
+  "action": "search_material",
+  "q": "valve"
+}}
+
+
+User:
+Give me a material from the database
+
+Response:
+{{
+  "action": "search_material",
+  "q": null
+}}
+
+
+User:
+Show materials in plant 1000
+
+Response:
+{{
+  "action": "search_material",
+  "q": null,
   "plant": "1000"
 }}
 
@@ -1300,7 +2792,35 @@ Response:
 
 
 User:
-What does FERT mean in SAP MM?
+Hi, I want to create a pump in plant 1000
+
+Response:
+{{
+  "action": "need_information",
+  "material_description": "Pump",
+  "plant": "1000",
+  "missing_fields": [
+    "material_type",
+    "material_group",
+    "base_unit"
+  ]
+}}
+
+
+User:
+[RECENT CONVERSATION CONTEXT: previous search used q="pump", plant="1000"]
+show me the relevant materials in plant 1000
+
+Response:
+{{
+  "action": "search_material",
+  "q": "pump",
+  "plant": "1000"
+}}
+
+
+User:
+What does FERT mean?
 
 Response:
 {{
@@ -1317,35 +2837,16 @@ Response:
 }}
 
 
-User:
-Write Python code for me
-
-Response:
-{{
-  "action": "reject"
-}}
-
-
-User:
-Who won the election?
-
-Response:
-{{
-  "action": "reject"
-}}
-
-
 User request:
 
 {message}
-
 
 Response:
 """
 
     generated = await generate_async(
         planner_prompt,
-        max_new_tokens=180,
+        max_new_tokens=200,
         do_sample=False,
     )
 
@@ -1362,11 +2863,7 @@ Response:
     )
 
     # ========================================================
-    # PARSE FIRST JSON OBJECT
-    #
-    # extract_json_object uses json.JSONDecoder().raw_decode, which
-    # correctly handles a balanced (possibly nested) object, unlike
-    # a non-greedy regex which truncates on the first "}" it sees.
+    # PARSE QWEN RESPONSE
     # ========================================================
 
     try:
@@ -1375,31 +2872,29 @@ Response:
             generated
         )
 
-        print(
-            "PLANNER DECISION:",
-            decision,
-        )
-
     except (
         json.JSONDecodeError,
         ValueError,
-    ) as e:
+    ) as exc:
 
         print(
             "ERROR: Could not parse planner JSON:",
-            e,
+            exc,
         )
 
-        return (
-            OUT_OF_SCOPE_MESSAGE
-        )
+        return OUT_OF_SCOPE_MESSAGE
+
+    print(
+        "PLANNER DECISION:",
+        decision,
+    )
 
     action = decision.get(
         "action"
     )
 
     # ========================================================
-    # PYTHON-SIDE ACTION ALLOWLIST
+    # ACTION ALLOWLIST
     # ========================================================
 
     if (
@@ -1412,23 +2907,22 @@ Response:
             action,
         )
 
-        return (
-            OUT_OF_SCOPE_MESSAGE
-        )
+        return OUT_OF_SCOPE_MESSAGE
 
     # ========================================================
-    # REJECT OUT-OF-SCOPE
+    # REJECT
     # ========================================================
 
-    if action == "reject":
+    if (
+        action
+        == "reject"
+    ):
 
         print(
             "ACTION: Rejected out-of-scope request"
         )
 
-        return (
-            OUT_OF_SCOPE_MESSAGE
-        )
+        return OUT_OF_SCOPE_MESSAGE
 
     # ========================================================
     # SEARCH MATERIAL
@@ -1439,39 +2933,131 @@ Response:
         == "search_material"
     ):
 
+        search = normalize_search_decision(
+            decision
+        )
+
+        # Deterministic backstop alongside the RECENT CONVERSATION
+        # CONTEXT prompt block: if the planner returned no keyword
+        # but the message reads as a continuation ("show me the
+        # relevant materials...") and we have a keyword from the
+        # prior turn in this session, carry it forward instead of
+        # silently falling back to "everything in this plant."
+        if not search["q"] and message_has_continuity_cue(message):
+            remembered = get_last_search_entities(
+                session_contexts,
+                session_id,
+            )
+            if remembered.get("q"):
+                print(
+                    "CARRYING FORWARD PRIOR SEARCH KEYWORD:",
+                    remembered["q"],
+                )
+                search["q"] = remembered["q"]
+                for field in (
+                    "material_type",
+                    "material_group",
+                ):
+                    if not search.get(field) and remembered.get(field):
+                        search[field] = remembered[field]
+
         print(
             "ACTION: Calling MCP search_material_master"
         )
 
-        materials = (
-            await search_material_master(
-                q=decision.get(
-                    "q"
-                ),
+        try:
 
-                plant=decision.get(
-                    "plant"
-                ),
+            materials = (
+                await search_material_master(
+                    q=search[
+                        "q"
+                    ],
 
-                material_type=
-                    decision.get(
+                    plant=search[
+                        "plant"
+                    ],
+
+                    material_type=search[
                         "material_type"
-                    ),
+                    ],
 
-                material_group=
-                    decision.get(
+                    material_group=search[
                         "material_group"
-                    ),
+                    ],
+                )
             )
+
+        except Exception as exc:
+
+            print(
+                "ERROR: MCP material search failed:",
+                exc,
+            )
+
+            return (
+                "I couldn't search the material master because "
+                "the material service is unavailable."
+            )
+
+        print(
+            "MCP SEARCH RESULT COUNT:",
+            (
+                len(materials)
+                if isinstance(
+                    materials,
+                    list,
+                )
+                else "non-list"
+            ),
         )
 
-        return format_search_results(
-            message=message,
-            materials=materials,
+        reply = format_search_results(message=message, materials=materials)
+        remember_query_context(
+            session_contexts,
+            session_id,
+            message,
+            reply,
+            bool(materials),
         )
+        remember_search_entities(
+            session_contexts,
+            session_id,
+            {
+                "q": search["q"],
+                "plant": search["plant"],
+                "material_type": search["material_type"],
+                "material_group": search["material_group"],
+            },
+        )
+        return reply
 
     # ========================================================
-    # GET SPECIFIC MATERIAL
+    # DYNAMIC READ-ONLY MATERIAL QUERY
+    # ========================================================
+
+    if action == "query_materials":
+        try:
+            query_plan = validate_query_plan(decision.get("query_plan"))
+        except (TypeError, ValueError) as exc:
+            print("BLOCKED INVALID QUERY PLAN:", exc)
+            return (
+                "I understood this as a Material Master analysis, but the "
+                "query plan was not safe or valid. Please rephrase the request."
+            )
+        try:
+            result = await query_material_master(query_plan)
+        except Exception as exc:
+            print("ERROR: MCP analytical query failed:", exc)
+            return "I couldn't query the material master because the material service is unavailable."
+        reply = format_query_results(result)
+        found = bool(result.get("items") or result.get("rows")) if isinstance(result, dict) else False
+        if isinstance(result, dict) and result.get("kind") == "aggregate":
+            found = result.get("value") is not None or found
+        remember_query_context(session_contexts, session_id, message, reply, found)
+        return reply
+
+    # ========================================================
+    # GET MATERIAL
     # ========================================================
 
     if (
@@ -1479,10 +3065,15 @@ Response:
         == "get_material"
     ):
 
-        material_number = (
+        material_number = clean_optional_value(
             decision.get(
                 "material_number"
-            )
+            ),
+            {
+                "material number",
+                "material",
+                "number",
+            },
         )
 
         if not material_number:
@@ -1492,20 +3083,40 @@ Response:
                 "you want me to retrieve."
             )
 
+        material_number = (
+            material_number.upper()
+        )
+
         print(
             "ACTION: Calling MCP explain_material_master:",
             material_number,
         )
 
-        material = (
-            await explain_material_master(
-                material_number
-            )
-        )
+        try:
 
-        return format_material(
-            message=message,
-            material=material,
+            material = (
+                await explain_material_master(
+                    material_number
+                )
+            )
+
+        except Exception as exc:
+
+            print(
+                "ERROR: Material lookup failed:",
+                exc,
+            )
+
+            return (
+                "I couldn't retrieve that material from "
+                "the material master."
+            )
+
+        return (
+            format_material(
+                message=message,
+                material=material,
+            )
         )
 
     # ========================================================
@@ -1516,6 +3127,38 @@ Response:
         action
         == "create_material"
     ):
+
+        # Deterministic backstop: drop any type/group/base_unit the
+        # planner guessed but that isn't actually grounded in what
+        # the user typed. See strip_ungrounded_create_fields().
+        decision = strip_ungrounded_create_fields(
+            decision,
+            message,
+        )
+
+        # A create request carries the same "what is the user talking
+        # about" signal as a search does (e.g. "create a pump in plant
+        # 1000" establishes description="pump", plant="1000") -- even
+        # when required fields are still missing. Without this, a
+        # later "show me the relevant materials" has nothing to carry
+        # forward, because remember_search_entities was previously
+        # only called from the search_material handler.
+        remember_search_entities(
+            session_contexts,
+            session_id,
+            {
+                "q": normalize_search_query(
+                    decision.get("material_description")
+                ),
+                "plant": normalize_plant(decision.get("plant")),
+                "material_type": normalize_material_type(
+                    decision.get("material_type")
+                ),
+                "material_group": normalize_material_group(
+                    decision.get("material_group")
+                ),
+            },
+        )
 
         required_fields = [
             "material_description",
@@ -1536,40 +3179,87 @@ Response:
 
         if missing:
 
-            return (
+            preview_matches: List[Dict[str, Any]] = []
+
+            try:
+                preview_matches = await search_material_master(
+                    q=normalize_search_query(
+                        decision.get("material_description")
+                    ),
+                    plant=normalize_plant(decision.get("plant")),
+                    material_type=None,
+                    material_group=None,
+                )
+            except Exception as exc:
+                print(
+                    "WARNING: preview similarity search failed:",
+                    exc,
+                )
+                preview_matches = []
+
+            reply = (
                 "I need more information before creating "
                 "the material. Missing: "
-                + ", ".join(
-                    missing
+                + ", ".join(missing)
+            )
+
+            if preview_matches:
+                reply += (
+                    "\n\nWhile you decide, here are existing materials "
+                    "that already look similar -- one of these might "
+                    "already be what you need:\n"
+                    + format_search_results(
+                        message=message,
+                        materials=preview_matches[:5],
+                    )
                 )
+
+            return reply
+
+        plant = normalize_plant(
+            decision.get(
+                "plant"
+            )
+        )
+
+        if not plant:
+
+            return (
+                "I need a valid numeric plant code before "
+                "creating the material."
             )
 
         proposal = {
-
             "material_description":
-                decision.get(
-                    "material_description"
-                ),
+                str(
+                    decision.get(
+                        "material_description"
+                    )
+                ).strip(),
 
             "material_type":
-                decision.get(
-                    "material_type"
-                ),
+                str(
+                    decision.get(
+                        "material_type"
+                    )
+                ).strip().upper(),
 
             "material_group":
-                decision.get(
-                    "material_group"
-                ),
+                str(
+                    decision.get(
+                        "material_group"
+                    )
+                ).strip().upper(),
 
             "base_unit":
-                decision.get(
-                    "base_unit"
-                ),
+                str(
+                    decision.get(
+                        "base_unit"
+                    )
+                ).strip().upper(),
 
             "plant":
-                decision.get(
-                    "plant"
-                ),
+                plant,
 
             "standard_price":
                 decision.get(
@@ -1577,14 +3267,16 @@ Response:
                 ),
 
             "currency":
-                decision.get(
-                    "currency",
-                    "USD",
-                ),
+                str(
+                    decision.get(
+                        "currency",
+                        "USD",
+                    )
+                ).strip().upper(),
         }
 
         # ----------------------------------------------------
-        # MANDATORY SIMILAR-MATERIAL CHECK
+        # REQUIRED DUPLICATE CHECK
         # ----------------------------------------------------
 
         try:
@@ -1597,20 +3289,15 @@ Response:
 
         except Exception:
 
-            # Fail closed.
-            #
-            # If the duplicate search fails,
-            # creation is blocked.
             return (
-                "I couldn't complete the required "
-                "duplicate-material check, so I did not "
-                "proceed with material creation. "
-                "Please try again after the material "
-                "master connection is available."
+                "I couldn't complete the required duplicate-material "
+                "check, so I did not proceed with material creation. "
+                "Please try again after the material master connection "
+                "is available."
             )
 
         # ----------------------------------------------------
-        # POSSIBLE DUPLICATE FOUND
+        # POSSIBLE DUPLICATE
         # ----------------------------------------------------
 
         if matches:
@@ -1618,7 +3305,6 @@ Response:
             pending_creations[
                 session_id
             ] = {
-
                 "_stage":
                     STAGE_SIMILARITY_CONFIRMATION,
 
@@ -1645,11 +3331,9 @@ Response:
         # NO DUPLICATE FOUND
         # ----------------------------------------------------
 
-        # Only now can we move to final creation confirmation.
         pending_creations[
             session_id
         ] = {
-
             "_stage":
                 STAGE_CREATION_CONFIRMATION,
 
@@ -1674,30 +3358,94 @@ Response:
         == "need_information"
     ):
 
-        missing_fields = (
-            decision.get(
-                "missing_fields",
-                [],
-            )
+        missing_fields = decision.get(
+            "missing_fields",
+            [],
         )
 
-        if missing_fields:
+        # The planner may embed whatever it did extract (description,
+        # plant, etc.) alongside missing_fields for this same action.
+        # Record it as entity memory and use it for a similarity
+        # preview, same as the create_material missing-fields branch --
+        # otherwise a later "show me the relevant materials" has
+        # nothing to carry forward whenever the model picks
+        # need_information instead of create_material for an
+        # equivalent partial request.
+        remember_search_entities(
+            session_contexts,
+            session_id,
+            {
+                "q": normalize_search_query(
+                    decision.get("material_description")
+                ),
+                "plant": normalize_plant(decision.get("plant")),
+                "material_type": normalize_material_type(
+                    decision.get("material_type")
+                ),
+                "material_group": normalize_material_group(
+                    decision.get("material_group")
+                ),
+            },
+        )
 
-            return (
+        if (
+            isinstance(
+                missing_fields,
+                list,
+            )
+            and missing_fields
+        ):
+
+            reply = (
                 "I need more information before creating "
                 "the material. Please provide: "
                 + ", ".join(
-                    missing_fields
+                    str(field)
+                    for field
+                    in missing_fields
                 )
             )
 
-        return (
-            "I need more information before creating "
-            "the material."
-        )
+        else:
+
+            reply = (
+                "I need more information before creating "
+                "the material."
+            )
+
+        preview_matches: List[Dict[str, Any]] = []
+
+        try:
+            preview_matches = await search_material_master(
+                q=normalize_search_query(
+                    decision.get("material_description")
+                ),
+                plant=normalize_plant(decision.get("plant")),
+                material_type=None,
+                material_group=None,
+            )
+        except Exception as exc:
+            print(
+                "WARNING: preview similarity search failed:",
+                exc,
+            )
+            preview_matches = []
+
+        if preview_matches:
+            reply += (
+                "\n\nWhile you decide, here are existing materials "
+                "that already look similar -- one of these might "
+                "already be what you need:\n"
+                + format_search_results(
+                    message=message,
+                    materials=preview_matches[:5],
+                )
+            )
+
+        return reply
 
     # ========================================================
-    # GENERAL SAP MM MATERIAL MASTER ANSWER
+    # SAP MM INFORMATIONAL QUESTION
     # ========================================================
 
     if (
@@ -1709,299 +3457,14 @@ Response:
             "ACTION: SAP MM informational answer"
         )
 
-        return await generate_sap_mm_answer(
-            message
+        return (
+            await generate_sap_mm_answer(
+                message
+            )
         )
 
     # ========================================================
     # DEFAULT DENY
     # ========================================================
 
-    return (
-        OUT_OF_SCOPE_MESSAGE
-    )
-
-
-# ============================================================
-# GENERAL SAP MM ANSWER
-# ============================================================
-
-async def generate_sap_mm_answer(
-    message: str,
-) -> str:
-
-    # Deterministic lookup first. Most "what does X mean" questions
-    # hit a fixed SAP-defined code, so answer those without any model
-    # call — zero hallucination risk and effectively instant.
-    normalized = normalize_text(message)
-
-    for code, meaning in SAP_CODE_GLOSSARY.items():
-        # Match the code as a whole token so "F" doesn't match inside
-        # an unrelated word.
-        if re.search(rf"\b{re.escape(code.lower())}\b", normalized):
-            return f"{code}: {meaning}"
-
-    # Fall back to the model only for phrasing/explanation questions
-    # the glossary doesn't cover.
-    prompt = f"""
-{SYSTEM_PROMPT}
-
-You are restricted to SAP MM Material Master.
-
-The user asked:
-
-{message}
-
-Answer ONLY if the question is directly related
-to SAP MM Material Master.
-
-Do not answer unrelated questions.
-
-Do not browse the internet.
-
-Do not claim to have searched the internet.
-
-Keep the answer concise.
-
-Assistant:
-"""
-
-    answer = await generate_async(
-        prompt,
-        max_new_tokens=250,
-        do_sample=False,
-        repetition_penalty=1.1,
-    )
-
-    return strip_browsing_claims(answer)
-
-
-# ============================================================
-# FORMAT SEARCH RESULTS
-# ============================================================
-
-def format_search_results(
-    message: str,
-    materials,
-) -> str:
-    """
-    Render real MCP search results as plain text.
-
-    This is deliberately plain string formatting rather than an LLM
-    call: the data is already structured and correct, so handing it
-    to the model to "rewrite" only adds latency and a chance of it
-    dropping, altering, or inventing a field.
-    """
-
-    if not materials:
-
-        return (
-            "I couldn't find any matching materials."
-        )
-
-    lines = [f"Found {len(materials)} matching material(s):\n"]
-
-    for material in materials:
-
-        if not isinstance(material, dict):
-            continue
-
-        number = get_material_value(
-            material, "material", "Material", "material_number", "MaterialNumber"
-        )
-        description = get_material_value(
-            material, "material_description", "MaterialDescription",
-            "description", "Description",
-        )
-        material_type = get_material_value(material, "material_type", "MaterialType")
-        plant = get_material_value(material, "plant", "Plant")
-        price = get_material_value(material, "standard_price", "StandardPrice")
-        currency = get_material_value(material, "currency", "Currency")
-
-        lines.append(
-            f"• {number} — {description}\n"
-            f"  Type: {material_type} | Plant: {plant} | "
-            f"Price: {price} {currency or ''}".rstrip()
-        )
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# FORMAT SINGLE MATERIAL
-# ============================================================
-
-def format_material(
-    message: str,
-    material,
-) -> str:
-    """
-    Render a single real MCP material record as plain text.
-
-    Code meanings come, in priority order, from:
-    1. The MCP server's own `code_meanings` (authoritative — it knows
-       this org's actual configuration), if present.
-    2. The static SAP_CODE_GLOSSARY fallback.
-    3. The raw code, unexplained, if neither has it — we never let
-       the model guess at a meaning it wasn't given.
-
-    No model call: same reasoning as format_search_results.
-    """
-
-    if not material:
-
-        return (
-            "I couldn't find that material."
-        )
-
-    code_meanings = material.get("code_meanings", {}) if isinstance(material, dict) else {}
-
-    def explain(code):
-        if not code:
-            return code
-        if code in code_meanings:
-            return f"{code} ({code_meanings[code]})"
-        if code in SAP_CODE_GLOSSARY:
-            return f"{code} ({SAP_CODE_GLOSSARY[code]})"
-        return code
-
-    material_type = get_material_value(material, "material_type", "MaterialType")
-    procurement_type = get_material_value(material, "procurement_type", "ProcurementType")
-    mrp_type = get_material_value(material, "mrp_type", "MRPType")
-    price_control = get_material_value(material, "price_control", "PriceControl")
-
-    lines = [
-        f"Material Number: {get_material_value(material, 'material', 'Material', 'material_number', 'MaterialNumber')}",
-        f"Description: {get_material_value(material, 'material_description', 'MaterialDescription', 'description', 'Description')}",
-        f"Material Type: {explain(material_type)}",
-        f"Material Group: {get_material_value(material, 'material_group', 'MaterialGroup')}",
-        f"Plant: {get_material_value(material, 'plant', 'Plant')}",
-        f"Procurement Type: {explain(procurement_type)}",
-        f"MRP Type: {explain(mrp_type)}",
-        f"Valuation Class: {get_material_value(material, 'valuation_class', 'ValuationClass')}",
-        f"Price Control: {explain(price_control)}",
-        f"Standard Price: {get_material_value(material, 'standard_price', 'StandardPrice')}",
-        f"Currency: {get_material_value(material, 'currency', 'Currency')}",
-    ]
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# FORMAT CREATE RESULT
-# ============================================================
-
-def format_create_result(
-    result,
-) -> str:
-
-    if not result:
-
-        return (
-            "The material creation request returned "
-            "no result."
-        )
-
-    status = result.get(
-        "status"
-    )
-
-    # --------------------------------------------------------
-    # VALIDATION FAILURE
-    # --------------------------------------------------------
-
-    if (
-        status
-        == "VALIDATION_FAILED"
-    ):
-
-        errors = result.get(
-            "errors",
-            [],
-        )
-
-        if not errors:
-
-            return (
-                "Material creation failed validation."
-            )
-
-        return (
-            "Material creation failed validation:\n\n"
-            + "\n".join(
-                f"- {error}"
-                for error
-                in errors
-            )
-        )
-
-    # --------------------------------------------------------
-    # SUCCESS
-    # --------------------------------------------------------
-
-    if (
-        status
-        == "CREATED"
-    ):
-
-        payload = result.get(
-            "material",
-            {},
-        )
-
-        if isinstance(
-            payload,
-            dict,
-        ):
-
-            material = payload.get(
-                "material",
-                payload,
-            )
-
-        else:
-
-            material = {}
-
-        return (
-            "Material created successfully.\n\n"
-
-            f"Material Number: "
-            f"{material.get('material')}\n"
-
-            f"Description: "
-            f"{material.get('material_description')}\n"
-
-            f"Material Type: "
-            f"{material.get('material_type')}\n"
-
-            f"Plant: "
-            f"{material.get('plant')}\n"
-
-            f"Procurement Type: "
-            f"{material.get('procurement_type')}\n"
-
-            f"MRP Type: "
-            f"{material.get('mrp_type')}\n"
-
-            f"Valuation Class: "
-            f"{material.get('valuation_class')}\n"
-
-            f"Price Control: "
-            f"{material.get('price_control')}\n"
-
-            f"Standard Price: "
-            f"{material.get('standard_price')}\n"
-
-            f"Currency: "
-            f"{material.get('currency')}"
-        )
-
-    # --------------------------------------------------------
-    # UNKNOWN STATUS
-    # --------------------------------------------------------
-
-    return (
-        "The material creation request completed, "
-        "but the returned status was not recognized."
-    )
+    return OUT_OF_SCOPE_MESSAGE

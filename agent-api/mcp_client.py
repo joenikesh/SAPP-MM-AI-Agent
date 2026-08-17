@@ -60,6 +60,18 @@ async def search_material_master(
         return parse_tool_content(result)
 
 
+async def query_material_master(query_plan: dict):
+    async with client:
+        result = await client.call_tool(
+            "query_material_master",
+            {"query_plan": query_plan},
+        )
+        parsed = parse_tool_content(result)
+        if isinstance(parsed, list) and len(parsed) == 1:
+            return parsed[0]
+        return parsed
+
+
 async def get_material_master(material_number: str):
     async with client:
         result = await client.call_tool(

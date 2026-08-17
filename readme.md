@@ -126,6 +126,7 @@ Current MCP capabilities include:
 
 ```text
 search_material_master
+query_material_master
 get_material_master
 explain_material_master
 create_material_master
@@ -134,6 +135,31 @@ create_material_master
 The MCP layer also contains SAP MM-specific validation and defaults.
 
 The agent cannot execute arbitrary database operations.
+
+### Dynamic analytical queries
+
+Natural-language analysis is translated into a validated, read-only query
+plan. Plans can combine allowlisted text search, field filters, numeric
+comparisons, sorting, limits, and aggregates. Python validates every field and
+operator before the MCP tool is called, and the Material API compiles the plan
+to SQLAlchemy expressions. The model never generates SQL or receives database
+access.
+
+Examples include:
+
+- `cheapest pump in plant 1000`
+- `highest standard price`
+- `materials over $500`
+- `average moving average price by material type`
+
+Unknown fields, unknown operators, extra plan properties, excessive limits,
+and write-like instructions are rejected. Price comparisons do not perform
+implicit currency conversion.
+
+All Material Master business fields represented by the prototype model are
+queryable, including basic data, plant and storage data, purchasing, MRP,
+valuation, stock planning, weight and volume, sales, batch/serial controls,
+and origin data. The internal database `id` is deliberately excluded.
 
 ### Material API
 

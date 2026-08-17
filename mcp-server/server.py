@@ -1,19 +1,15 @@
 from mcp.server.fastmcp import FastMCP
 from rules.sap_codes import explain_material_codes
-from material_api_client import (
-    search_materials,
-    get_material,
-)
-
-mcp = FastMCP("SAP MM MCP Server")
 from rules.validation import validate_material_request
 from rules.defaults import DEFAULTS_BY_MATERIAL_TYPE
-
 from material_api_client import (
     search_materials,
     get_material,
     create_material,
+    query_materials,
 )
+
+mcp = FastMCP("SAP MM MCP Server")
 
 @mcp.tool()
 async def search_material_master(
@@ -35,6 +31,16 @@ async def search_material_master(
         material_type=material_type,
         material_group=material_group,
     )
+
+
+@mcp.tool()
+async def query_material_master(query_plan: dict):
+    """Execute a validated read-only Material Master query plan.
+
+    The plan supports allowlisted filters, sorting, limits and aggregates.
+    It never accepts SQL, URLs, table names, or write operations.
+    """
+    return await query_materials(query_plan)
 
 
 @mcp.tool()

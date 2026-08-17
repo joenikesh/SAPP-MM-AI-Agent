@@ -5,6 +5,7 @@ from fastapi import Query
 from database import Base, engine, SessionLocal
 from models import Material
 from schemas import MaterialCreate
+from query_engine import MaterialQueryRequest, execute_material_query
 
 
 Base.metadata.create_all(bind=engine)
@@ -79,6 +80,18 @@ def search_materials(
         )
 
     return query.limit(20).all()
+
+
+@app.post(
+    "/materials/query",
+    summary="Execute a validated analytical material query",
+)
+def query_materials(
+    request: MaterialQueryRequest,
+    db: Session = Depends(get_db),
+):
+    """Execute only the allowlisted filters, sorts and aggregates."""
+    return execute_material_query(db, request)
 
 
 @app.post("/materials")
@@ -172,4 +185,3 @@ def get_material(
         )
 
     return material
-
